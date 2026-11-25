@@ -67,16 +67,67 @@ func (h *connIDManager) Add(f *wire.NewConnectionIDFrame) error {
 	h.pathMx.Lock()
 	defer h.pathMx.Unlock()
 
-	if err := h.add(f); err != nil {
+	if err := h.checkAdd(f); err != nil {
 		return err
 	}
-	if len(h.queue) >= protocol.MaxActiveConnectionIDs {
+
+	var queuedFrames []wire.Frame
+	queueFrame := func(frame wire.Frame) { queuedFrames = append(queuedFrames, frame) }
+	if err := h.addWithQueue(f, queueFrame); err != nil {
+		return err
+	}
+	for _, frame := range queuedFrames {
+		h.queueControlFrame(frame)
+	}
+	return nil
+}
+
+func (h *connIDManager) checkAdd(f *wire.NewConnectionIDFrame) error {
+	if h.activeConnectionID.Len() == 0 {
+		return &qerr.TransportError{
+			ErrorCode:    qerr.ProtocolViolation,
+			ErrorMessage: "received NEW_CONNECTION_ID frame but zero-length connection IDs are in use",
+		}
+	}
+
+	highestRetired := h.highestRetired
+	queue := slices.Clone(h.queue)
+	if f.RetirePriorTo > highestRetired {
+		highestRetired = f.RetirePriorTo
+		queue = slices.DeleteFunc(queue, func(entry newConnID) bool {
+			return entry.SequenceNumber < f.RetirePriorTo
+		})
+	}
+
+	retireImmediately := f.SequenceNumber <= h.highestUsedSequenceNumber ||
+		f.SequenceNumber < highestRetired
+	if !h.isInUse(f.SequenceNumber) && !retireImmediately {
+		var err error
+		queue, err = addConnectionIDToQueue(
+			queue,
+			f.SequenceNumber,
+			f.ConnectionID,
+			f.StatelessResetToken,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	if h.activeSequenceNumber < highestRetired && len(queue) > 0 {
+		queue = queue[1:]
+	}
+	if len(queue) >= protocol.MaxActiveConnectionIDs {
 		return &qerr.TransportError{ErrorCode: qerr.ConnectionIDLimitError}
 	}
 	return nil
 }
 
 func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
+	return h.addWithQueue(f, h.queueControlFrame)
+}
+
+func (h *connIDManager) addWithQueue(f *wire.NewConnectionIDFrame, queueFrame func(wire.Frame)) error {
 	if h.activeConnectionID.Len() == 0 {
 		return &qerr.TransportError{
 			ErrorCode:    qerr.ProtocolViolation,
@@ -88,7 +139,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 	if f.RetirePriorTo != 0 && h.pathProbing != nil {
 		for id, entry := range h.pathProbing {
 			if entry.SequenceNumber < f.RetirePriorTo {
-				h.queueControlFrame(&wire.RetireConnectionIDFrame{
+				queueFrame(&wire.RetireConnectionIDFrame{
 					SequenceNumber: entry.SequenceNumber,
 				})
 				h.removeStatelessResetToken(entry.StatelessResetToken)
@@ -104,7 +155,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 			if entry.SequenceNumber >= f.RetirePriorTo {
 				newQueue = append(newQueue, entry)
 			} else {
-				h.queueControlFrame(&wire.RetireConnectionIDFrame{SequenceNumber: entry.SequenceNumber})
+				queueFrame(&wire.RetireConnectionIDFrame{SequenceNumber: entry.SequenceNumber})
 			}
 		}
 		h.queue = newQueue
@@ -118,7 +169,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 		// or skipped because the NEW_CONNECTION_ID frame was reordered.
 		// Send the RETIRE_CONNECTION_ID frame immediately.
 		if f.SequenceNumber <= h.highestUsedSequenceNumber || f.SequenceNumber < h.highestRetired {
-			h.queueControlFrame(&wire.RetireConnectionIDFrame{
+			queueFrame(&wire.RetireConnectionIDFrame{
 				SequenceNumber: f.SequenceNumber,
 			})
 		} else if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
@@ -130,7 +181,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 	// If this frame's connection ID is in use or was retired, the peer might not have provided a new connection ID yet.
 	// The active connection ID is then retired once it does.
 	if h.activeSequenceNumber < h.highestRetired && len(h.queue) > 0 {
-		h.updateConnectionID()
+		h.updateConnectionIDWithQueue(queueFrame)
 	}
 	return nil
 }
@@ -148,54 +199,74 @@ func (h *connIDManager) isInUse(seq uint64) bool {
 }
 
 func (h *connIDManager) addConnectionID(seq uint64, connID protocol.ConnectionID, resetToken protocol.StatelessResetToken) error {
+	queue, err := addConnectionIDToQueue(h.queue, seq, connID, resetToken)
+	if err != nil {
+		return err
+	}
+	h.queue = queue
+	return nil
+}
+
+func addConnectionIDToQueue(
+	queue []newConnID,
+	seq uint64,
+	connID protocol.ConnectionID,
+	resetToken protocol.StatelessResetToken,
+) ([]newConnID, error) {
 	// fast path: add to the end of the queue
-	if len(h.queue) == 0 || h.queue[len(h.queue)-1].SequenceNumber < seq {
-		h.queue = append(h.queue, newConnID{
+	if len(queue) == 0 || queue[len(queue)-1].SequenceNumber < seq {
+		return append(queue, newConnID{
 			SequenceNumber:      seq,
 			ConnectionID:        connID,
 			StatelessResetToken: resetToken,
-		})
-		return nil
+		}), nil
 	}
 
 	// slow path: insert in the middle
-	for i, entry := range h.queue {
+	for i, entry := range queue {
 		if entry.SequenceNumber == seq {
 			if entry.ConnectionID != connID {
-				return fmt.Errorf("received conflicting connection IDs for sequence number %d", seq)
+				return nil, fmt.Errorf("received conflicting connection IDs for sequence number %d", seq)
 			}
 			if entry.StatelessResetToken != resetToken {
-				return fmt.Errorf("received conflicting stateless reset tokens for sequence number %d", seq)
+				return nil, fmt.Errorf("received conflicting stateless reset tokens for sequence number %d", seq)
 			}
-			return nil
+			return queue, nil
 		}
 
 		// insert at the correct position to maintain sorted order
 		if entry.SequenceNumber > seq {
-			h.queue = slices.Insert(h.queue, i, newConnID{
+			return slices.Insert(queue, i, newConnID{
 				SequenceNumber:      seq,
 				ConnectionID:        connID,
 				StatelessResetToken: resetToken,
-			})
-			return nil
+			}), nil
 		}
 	}
-	return nil // unreachable
+	return queue, nil // unreachable
 }
 
 func (h *connIDManager) updateConnectionID() {
+	h.updateConnectionIDWithQueue(h.queueControlFrame)
+}
+
+func (h *connIDManager) updateConnectionIDWithQueue(queueFrame func(wire.Frame)) {
 	h.assertNotClosed()
 	front := h.queue[0]
 	h.queue = h.queue[1:]
 	h.highestUsedSequenceNumber = front.SequenceNumber
-	h.replaceActiveConnectionID(front)
+	h.replaceActiveConnectionIDWithQueue(front, queueFrame)
 	h.addStatelessResetToken(front.StatelessResetToken)
 }
 
 // replaceActiveConnectionID retires the active connection ID, and makes c the active connection ID.
 // It doesn't add the stateless reset token of c.
 func (h *connIDManager) replaceActiveConnectionID(c newConnID) {
-	h.queueControlFrame(&wire.RetireConnectionIDFrame{
+	h.replaceActiveConnectionIDWithQueue(c, h.queueControlFrame)
+}
+
+func (h *connIDManager) replaceActiveConnectionIDWithQueue(c newConnID, queueFrame func(wire.Frame)) {
+	queueFrame(&wire.RetireConnectionIDFrame{
 		SequenceNumber: h.activeSequenceNumber,
 	})
 	if h.activeStatelessResetToken != nil {
