@@ -55,6 +55,10 @@ type ShortHeaderSealer interface {
 type ConnectionState struct {
 	tls.ConnectionState
 	Used0RTT bool
+	// SessionTicketIdentity is the raw PSK identity (the serialized session
+	// ticket) presented by the client when resuming the session. It is only set
+	// on the server and is used to bind 0-RTT replay fingerprints to a ticket.
+	SessionTicketIdentity []byte
 }
 
 // EventKind is the kind of handshake event.

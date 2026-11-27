@@ -203,6 +203,8 @@ type Conn struct {
 	handshakeComplete  bool
 	handshakeConfirmed bool
 
+	earlyDataReplay *earlyDataReplayGuard // only used on the server when Config.ReplayCache is set
+
 	receivedRetry       bool
 	versionNegotiated   bool
 	receivedFirstPacket bool
@@ -1918,6 +1920,11 @@ func (c *Conn) handleFrames(
 				continue
 			}
 			wire.LogFrame(c.logger, streamFrame, false)
+			if encLevel == protocol.Encryption0RTT {
+				if err := c.check0RTTStreamReplay(streamFrame); err != nil {
+					return false, false, nil, err
+				}
+			}
 			handleErr = c.streamsMap.HandleStreamFrame(streamFrame, rcvTime)
 		} else if frameType.IsAckFrameType() {
 			ackFrame, l, err := c.frameParser.ParseAckFrame(frameType, data, encLevel, c.version)

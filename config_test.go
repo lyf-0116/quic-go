@@ -128,6 +128,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "Allow0RTT":
 			f.Set(reflect.ValueOf(true))
+		case "ReplayCache":
+			f.Set(reflect.ValueOf(NewReplayCache()))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
 		default:

@@ -166,6 +166,8 @@ func (l *Listener) Addr() net.Addr {
 // For connection using 0-RTT, this allows the server to accept and respond to streams that the client opened in the
 // 0-RTT data it sent. Note that at this point during the handshake, the live-ness of the
 // client has not yet been confirmed, and the 0-RTT data could have been replayed by an attacker.
+// Set Config.ReplayCache to detect and reject replayed 0-RTT early data based on the session
+// ticket and a request digest.
 type EarlyListener struct {
 	baseServer *baseServer
 }

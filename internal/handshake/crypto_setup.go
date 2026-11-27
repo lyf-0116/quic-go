@@ -47,6 +47,11 @@ type cryptoSetup struct {
 
 	zeroRTTOpener LongHeaderOpener // only set for the server
 	zeroRTTSealer LongHeaderSealer // only set for the client
+
+	// ticketIdentity is the raw session ticket (PSK identity) received from the
+	// client. Server only. It is written by the TLS handshake goroutine and read
+	// by the connection's run loop, so it is stored atomically.
+	ticketIdentity atomic.Pointer[[]byte]
 	// set when the server receives its first 1-RTT packet while holding 0-RTT keys
 	first1RTTPacketTime monotime.Time
 
@@ -123,6 +128,22 @@ func NewCryptoSetupServer(
 	cs.allow0RTT = allow0RTT
 
 	tlsConf = setupConfigForServer(tlsConf, localAddr, remoteAddr)
+	// setupConfigForServer clones the config on some Go versions, but not all.
+	// Clone again so that installing the ticket-identity hook never mutates a
+	// tls.Config shared between connections or owned by the caller.
+	tlsConf = tlsConf.Clone()
+	prevUnwrapSession := tlsConf.UnwrapSession
+	tlsConf.UnwrapSession = func(identity []byte, state tls.ConnectionState) (*tls.SessionState, error) {
+		// Capture the raw ticket (PSK identity) so that 0-RTT replay fingerprints
+		// can be bound to it. The identity bytes are only valid for this call.
+		ticket := append([]byte(nil), identity...)
+		cs.ticketIdentity.Store(&ticket)
+		if prevUnwrapSession != nil {
+			return prevUnwrapSession(identity, state)
+		}
+		// Mirror crypto/tls' default behavior when no UnwrapSession is set.
+		return tlsConf.DecryptTicket(identity, state)
+	}
 
 	cs.tlsConf = tlsConf
 	cs.conn = tls.QUICServer(getQUICConfig(tlsConf, localAddr, remoteAddr))
@@ -695,9 +716,14 @@ func (h *cryptoSetup) maybeDrop0RTTKeys() {
 }
 
 func (h *cryptoSetup) ConnectionState() ConnectionState {
+	var ticketIdentity []byte
+	if ticket := h.ticketIdentity.Load(); ticket != nil {
+		ticketIdentity = *ticket
+	}
 	return ConnectionState{
-		ConnectionState: h.conn.ConnectionState(),
-		Used0RTT:        h.used0RTT.Load(),
+		ConnectionState:       h.conn.ConnectionState(),
+		Used0RTT:              h.used0RTT.Load(),
+		SessionTicketIdentity: ticketIdentity,
 	}
 }
 

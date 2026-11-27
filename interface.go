@@ -188,6 +188,24 @@ type Config struct {
 	// Allow0RTT allows the application to decide if a 0-RTT connection attempt should be accepted.
 	// Only valid for the server.
 	Allow0RTT bool
+	// ReplayCache enables server-side replay protection for 0-RTT early data.
+	// When set, 0-RTT STREAM frames are fingerprinted together with the TLS
+	// session ticket and checked against the cache before being delivered to the
+	// stream layer. A duplicate (a replayed frame on a different connection) is
+	// rejected and the replayed connection is closed, so the duplicate request
+	// never reaches the application.
+	//
+	// The same ReplayCache value may be shared between multiple Transports (and
+	// therefore server instances) in this process; SharedReplayCache provides a
+	// process-wide default. To share replay state between multiple machines
+	// behind a load balancer, provide an implementation backed by shared
+	// storage (e.g. Redis). Sharding the cache by instance would allow an
+	// attacker to bypass the check by replaying against a different instance.
+	//
+	// The cache entries should expire after (at most) the session ticket
+	// lifetime; LocalReplayCache uses DefaultReplayCacheTTL by default.
+	// Only used by the server, and only relevant when Allow0RTT is true.
+	ReplayCache ReplayCache
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
 	// Enable QUIC Stream Resets with Partial Delivery.
